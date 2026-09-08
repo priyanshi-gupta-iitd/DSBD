@@ -1,3 +1,4 @@
+import os
 import torch
 from torch.nn import functional as F
 import pickle
@@ -62,8 +63,64 @@ def match(result1, result2):
 
     return str_result1 == str_result2
 
+def resolve_spider_db(db, db_root: str = "./spider/database"):
+    """Return an existing sqlite path; handle nested unzip / broken scp symlink."""
+    candidates = [
+        f"{db_root}/{db}/{db}.sqlite",
+        f"./spider/database/{db}/{db}.sqlite",
+        f"./spider/spider/database/{db}/{db}.sqlite",
+        f"./spider/spider_data/database/{db}/{db}.sqlite",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
+
+def extract_sql(text: str) -> str:
+    """Pull a runnable SQL statement out of model text."""
+    if not text:
+        return ""
+    text = text.strip()
+    text = re.sub(r"```sql\s*", "", text, flags=re.I)
+    text = text.replace("```", "")
+    # drop a repeated prompt header
+    if "SQL:" in text:
+        text = text.split("SQL:")[-1].strip()
+    match = re.search(r"(?is)\b(select|with)\b.*", text)
+    if match:
+        text = match.group(0)
+    # first statement only
+    text = text.split(";")[0].strip()
+    text = " ".join(text.split())
+    return text
+
+
+def try_execute_sql(db, pred, db_root: str = "./spider/database"):
+    """Return (ok, error_message)."""
+    pred = extract_sql(pred)
+    if not pred:
+        return False, "empty_sql"
+    path = resolve_spider_db(db, db_root)
+    if not os.path.exists(path):
+        return False, f"missing_db:{path}"
+    try:
+        conn = sqlite3.connect(path)
+        conn.text_factory = bytes
+        cur = conn.cursor()
+        cur.execute(pred)
+        cur.fetchall()
+        conn.close()
+        return True, ""
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+
 def execution_accuracy(db, pred, sql):
-    conn = sqlite3.connect(f"./spider/database/{db}/{db}.sqlite")
+    path = resolve_spider_db(db)
+    if not os.path.exists(path):
+        return -1
+    conn = sqlite3.connect(path)
     conn.text_factory = bytes
     cur = conn.cursor()
     try:
@@ -72,7 +129,7 @@ def execution_accuracy(db, pred, sql):
         return -1
 
     try:
-        result = cur.execute(pred).fetchall()
+        result = cur.execute(extract_sql(pred) or pred).fetchall()
     except Exception as e:
         return 0
     spider_acc = float(match(result, gt_result))
@@ -209,24 +266,26 @@ def norm_logits(logits : torch.Tensor, temperature : float, top_k : float, top_p
 
 
 def sample(probs : torch.Tensor, num_samples: int = 1):
+    probs = probs.float()
+    probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+    probs = torch.clamp(probs, min=0)
+    if probs.sum() <= 0:
+        probs = torch.ones_like(probs)
+    probs = probs / probs.sum()
     if torch.numel(probs.nonzero()) < num_samples:
         replacement = True
     else:
         replacement = False
-#    """ for debugging """
-#    replacement = True
     try:
         idx_next = torch.multinomial(probs, num_samples=num_samples, replacement = replacement)
-    except:
-        print((probs<0).any(), probs.isnan().any(), probs.isinf().any())
-        raise RuntimeError('prob error')
+    except Exception:
+        idx_next = torch.argmax(probs, dim=-1, keepdim=True).expand(num_samples).clone()
+        if idx_next.dim() == 1:
+            idx_next = idx_next.view(1, -1)
 
     mask = torch.gather(probs, -1, idx_next) < 1e-3
     if mask.any():
         idx_next[mask] = torch.argmax(probs).item()
-   
-    #if (idx_next.item() == 0) and False:
-    #    raise RuntimeError
     return idx_next % probs.size(-1)
 
 

@@ -18,7 +18,7 @@ from sampling.models.modeling_llama import LlamaForCausalLM
 from sampling.models.modeling_opt import OPTForCausalLM
 from sampling.utils import exact_match_references, execution_accuracy_references 
 from sampling.utils import extract_first_function
-from sampling.utils import execution_accuracy
+from sampling.utils import execution_accuracy, extract_sql
 
 from constraints import build_constraint_manager, compute_goodput_row
 from constraints.z3_schema import SchemaFacts
@@ -175,7 +175,7 @@ def _METRICS_FIELDS():
         "tokens_constraint_rejected", "xgrammar_rejects", "z3_rejects",
         "wall_time_s", "xgrammar_time_s", "z3_time_s",
         "throughput", "goodput", "goodput_correct", "useful_frac",
-        "n_useful", "n_useful_correct", "executable", "exec_correct", "exec_acc",
+        "n_useful", "n_useful_correct", "executable", "exec_error", "exec_correct", "exec_acc",
         "acc_len_mean", "acc_rate",
         "width", "gamma", "w_thres", "min_w", "extra_sample_cnt",
     ]
@@ -198,7 +198,7 @@ def _decode_pred(tokenizer, output, input_len, dataset_name):
     if dataset_name == "squad":
         return text.split("\n")[0]
     if dataset_name == "spider":
-        return text.split(";")[0]
+        return extract_sql(text)
     return text
 
 
@@ -209,10 +209,12 @@ def _schema_facts_for_example(dataset_name, output_dataset, idx, spider_schema):
     return SchemaFacts.from_spider_frames(db_id, spider_schema)
 
 
-def _make_constraint_manager(mode, tokenizer, schema_facts):
+def _make_constraint_manager(mode, tokenizer, schema_facts, vocab_size=None):
     if mode == "none":
         return None
-    return build_constraint_manager(mode, tokenizer=tokenizer, schema_facts=schema_facts)
+    return build_constraint_manager(
+        mode, tokenizer=tokenizer, schema_facts=schema_facts, vocab_size=vocab_size
+    )
 
 
 #@measure_energy
@@ -421,7 +423,8 @@ SQL: SELECT count(*) FROM head WHERE age  >  56;
                 # AR baseline uses first constraint mode only when not ablating all for AR;
                 # keep unconstrained AR as quality ceiling unless constraints requested.
                 cm = _make_constraint_manager(constraint_modes[0] if constraint_modes[0] != "none" else "none",
-                                              tokenizer, facts)
+                                              tokenizer, facts,
+                                              vocab_size=getattr(large_model.config, "vocab_size", None))
                 t = process_time_ns()
                 output, details = autoregressive_sampling(
                     input_ids, large_model, num_tokens,
@@ -584,10 +587,13 @@ SQL: SELECT count(*) FROM head WHERE age  >  56;
 
                   for ex_i, input_ids in enumerate(tqdm(ds, desc=f"DSBD c={cmode} w={width}")):
                       cnt += 1
-                      input_ids = input_ids.to(torch_device)
-                      facts = _schema_facts_for_example(dataset_name, output_dataset, ex_i, spider_schema)
-                      cm = _make_constraint_manager(cmode, tokenizer, facts)
                       try:
+                        input_ids = input_ids.to(torch_device)
+                        facts = _schema_facts_for_example(dataset_name, output_dataset, ex_i, spider_schema)
+                        cm = _make_constraint_manager(
+                            cmode, tokenizer, facts,
+                            vocab_size=getattr(large_model.config, "vocab_size", None),
+                        )
                         t = process_time_ns()
                         output, details = beam_speculative_sampling(
                           input_ids, small_model, large_model,
@@ -660,7 +666,11 @@ SQL: SELECT count(*) FROM head WHERE age  >  56;
                           log_both(f'terminated at {cnt}')
                           break
                       except Exception as e:
-                          log_both(str(e))
+                          log_both(f"example {ex_i} constraints={cmode}: {e}")
+                          err = str(e).lower()
+                          if "device-side assert" in err or "cuda error" in err:
+                              log_both("CUDA context is dead; skipping remaining examples in this setting")
+                              break
 
                   t2 = time.time()
                   P.kill(); P.wait()

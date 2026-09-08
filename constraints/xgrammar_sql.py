@@ -76,20 +76,34 @@ class XGrammarSQLConstraint:
 
     def apply_to_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """
-        Mask logits in-place (or cloned) for beams.
-        logits: [num_beams, vocab] or [1, num_beams * vocab] flattened is NOT supported —
-        pass [num_beams, vocab].
+        Mask logits in-place for beams. logits: [num_beams, vocab].
+        If the grammar allows nothing (or vocab sizes disagree), leave that row unmasked
+        so sampling cannot emit an invalid CUDA index.
         """
         assert logits.dim() == 2
         num_beams = logits.size(0)
         self.ensure_beams(num_beams)
         bitmask = self.fill_bitmasks()
         t0 = process_time_ns()
-        # apply_token_bitmask_inplace expects bitmask on same device ideally
-        device_bitmask = bitmask
-        if logits.is_cuda:
-            device_bitmask = bitmask.to(logits.device)
-        self.xgr.apply_token_bitmask_inplace(logits, device_bitmask)
+        backup = logits.detach().clone()
+        vocab = logits.size(-1)
+        # apply only on the overlapping vocab prefix to avoid device-side OOB asserts
+        apply_vocab = min(vocab, self.vocab_size)
+        try:
+            sl = logits[:, :apply_vocab].contiguous()
+            self.xgr.apply_token_bitmask_inplace(sl, bitmask.to(logits.device) if logits.is_cuda else bitmask)
+            logits[:, :apply_vocab] = sl
+            if apply_vocab < vocab:
+                logits[:, apply_vocab:] = torch.finfo(logits.dtype).min
+        except Exception:
+            logits.copy_(backup)
+            self.time_ns += process_time_ns() - t0
+            return logits
+        # rows that became all -inf / nan → restore (empty grammar state)
+        finite = torch.isfinite(logits)
+        has_mass = finite.any(dim=-1)
+        if not has_mass.all():
+            logits[~has_mass] = backup[~has_mass]
         self.time_ns += process_time_ns() - t0
         return logits
 

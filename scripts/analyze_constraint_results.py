@@ -115,6 +115,13 @@ def main():
     summary.to_csv(args.out_csv, index=False)
     print(summary.to_string(index=False))
     print(f"\nWrote {args.out_csv}")
+    if "executable" in df.columns:
+        print(f"\nexecutable_rate overall: {df['executable'].mean():.3f}")
+        print("goodput is 0 on rows where executable=0 (SQL did not run).")
+    if "exec_error" in df.columns:
+        print("\nTop exec_error reasons (non-executable rows):")
+        bad = df[df.get("executable", 1) == 0] if "executable" in df.columns else df
+        print(bad["exec_error"].fillna("").value_counts().head(15).to_string())
     if not args.no_plot:
         maybe_plot(summary, args.plot_dir)
 

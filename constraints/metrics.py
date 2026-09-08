@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import sqlite3
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from typing import Any, Dict, Optional
 
 
@@ -53,17 +52,10 @@ class GoodputStats:
 
 def is_sql_executable(db: str, pred: str, db_root: str = "./spider/database") -> bool:
     """Return True if pred executes on the Spider sqlite DB (syntax+schema runnable)."""
-    path = f"{db_root}/{db}/{db}.sqlite"
-    try:
-        conn = sqlite3.connect(path)
-        conn.text_factory = bytes
-        cur = conn.cursor()
-        cur.execute(pred)
-        cur.fetchall()
-        conn.close()
-        return True
-    except Exception:
-        return False
+    from sampling.utils import try_execute_sql
+
+    ok, _ = try_execute_sql(db, pred, db_root)
+    return ok
 
 
 def compute_goodput_row(
@@ -89,10 +81,14 @@ def compute_goodput_row(
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build one metrics row; N_useful counts committed tokens only if SQL is executable."""
+    from sampling.utils import extract_sql, try_execute_sql
+
+    pred_sql = extract_sql(pred_sql or "")
     executable = False
     exec_correct = False
+    exec_error = ""
     if db_id is not None and pred_sql:
-        executable = is_sql_executable(db_id, pred_sql)
+        executable, exec_error = try_execute_sql(db_id, pred_sql)
         if exec_acc is not None:
             exec_correct = exec_acc >= 1.0
         elif reference is not None and "[SQL]" in reference:
@@ -102,6 +98,8 @@ def compute_goodput_row(
             acc = execution_accuracy(db_id, pred_sql, gt)
             exec_correct = acc >= 1.0
             exec_acc = float(max(acc, 0))
+    elif not pred_sql:
+        exec_error = "empty_sql"
 
     n_useful = committed_tokens if executable else 0
     n_useful_correct = committed_tokens if exec_correct else 0
@@ -128,6 +126,7 @@ def compute_goodput_row(
         "n_useful": n_useful,
         "n_useful_correct": n_useful_correct,
         "executable": int(executable),
+        "exec_error": exec_error,
         "exec_correct": int(exec_correct),
         "exec_acc": exec_acc if exec_acc is not None else (1.0 if exec_correct else 0.0),
         "acc_len_mean": acc_len_mean,
