@@ -4,11 +4,58 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import os
-from typing import Optional
+from typing import List
 
 import numpy as np
 import pandas as pd
+
+
+def load_metrics_csv(path: str) -> pd.DataFrame:
+    """Load metrics even if older rows lack exec_error (30 vs 31 columns)."""
+    with open(path, newline="") as f:
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            raise SystemExit(f"empty metrics csv: {path}")
+        raw_rows: List[List[str]] = [row for row in reader if row]
+
+    max_len = max((len(r) for r in raw_rows), default=len(header))
+    if "exec_error" not in header and max_len > len(header):
+        if "executable" in header:
+            i = header.index("executable") + 1
+        else:
+            i = len(header)
+        header = header[:i] + ["exec_error"] + header[i:]
+
+    aligned = []
+    for row in raw_rows:
+        if len(row) < len(header):
+            # old row: insert blank exec_error after executable
+            if "exec_error" in header and len(row) == len(header) - 1:
+                pos = header.index("exec_error")
+                row = row[:pos] + [""] + row[pos:]
+            else:
+                row = row + [""] * (len(header) - len(row))
+        elif len(row) > len(header):
+            row = row[: len(header)]
+        aligned.append(row)
+
+    df = pd.DataFrame(aligned, columns=header)
+    numeric = [
+        "example_idx", "committed_tokens", "tokens_proposed", "tokens_accepted",
+        "tokens_constraint_rejected", "xgrammar_rejects", "z3_rejects",
+        "wall_time_s", "xgrammar_time_s", "z3_time_s", "throughput", "goodput",
+        "goodput_correct", "useful_frac", "n_useful", "n_useful_correct",
+        "executable", "exec_correct", "exec_acc", "acc_len_mean", "acc_rate",
+        "width", "gamma", "w_thres", "min_w", "extra_sample_cnt",
+    ]
+    for col in numeric:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
 
 
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
@@ -109,7 +156,7 @@ def main():
     if not os.path.exists(args.metrics_csv):
         raise SystemExit(f"missing metrics csv: {args.metrics_csv}")
 
-    df = pd.read_csv(args.metrics_csv)
+    df = load_metrics_csv(args.metrics_csv)
     summary = summarize(df)
     os.makedirs(os.path.dirname(args.out_csv) or ".", exist_ok=True)
     summary.to_csv(args.out_csv, index=False)
