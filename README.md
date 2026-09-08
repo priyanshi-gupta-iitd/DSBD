@@ -163,6 +163,29 @@ python evaluation.py \
   --log_file logs/constraint_ablation.txt
 ```
 
+**2b. Beam-width ablation** — same 2×2 constraints, widths `2,3,4,5` (`gamma=3`, `w_thres=0.9`). 4 modes × 4 widths; use a **new** CSV:
+
+```bash
+python evaluation.py \
+  --approx_model_name meta-llama/Llama-3.2-1B \
+  --target_model_name meta-llama/Llama-3.1-8B \
+  --dataset spider --num_inputs 20 --max_tokens 64 \
+  --constraint_ablation --width_ablation --skip_baselines \
+  --metrics_csv logs/constraint_metrics_widths.csv \
+  --log_file logs/constraint_width_ablation.txt
+```
+
+`--dsbd_widths 2,4,6` overrides the default 2–5 list. Time: **~1.5–3 hours** at `num_inputs=20` (320 decodes); **~4–8 hours** at 50.
+
+**2c. Hypothesis test (AR vs DSBD, acc vs goodput)** — one script, models loaded once. Runs target AR (`none`, `both`) and DSBD (`none/xgrammar/z3/both`) on the same Spider examples, then writes plots:
+
+```bash
+bash scripts/run_hypothesis_gpu.sh
+# cheaper: NUM_INPUTS=20 bash scripts/run_hypothesis_gpu.sh
+```
+
+Expected time (weights cached): **~15–25 min** at 5 examples, **~40–70 min** at 20, **~1.5–2.5 h** at the default 50. Outputs: `logs/hypothesis_metrics.csv`, `logs/hypothesis_plots/goodput_vs_accuracy.png`.
+
 **3. Aggregate + plots:**
 
 ```bash

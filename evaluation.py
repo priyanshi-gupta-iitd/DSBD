@@ -1,6 +1,5 @@
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-#os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
 
 import pandas as pd
 import torch
@@ -109,6 +108,12 @@ def parse_arguments():
     parser.add_argument('--metrics_csv', type=str, default='logs/constraint_metrics.csv',
                         help='per-example metrics CSV for goodput analysis')
     parser.add_argument('--dsbd_width', type=int, default=4)
+    parser.add_argument('--dsbd_widths', type=str, default='',
+                        help='comma-separated beam widths to sweep, e.g. 2,3,4,5 (overrides --dsbd_width)')
+    parser.add_argument('--width_ablation', action='store_true', default=False,
+                        help='sweep beam widths 2,3,4,5 with otherwise fixed DSBD hyperparams')
+    parser.add_argument('--hypothesis_run', action='store_true', default=False,
+                        help='AR none/both + DSBD 2x2 on the same examples (acc vs goodput)')
     parser.add_argument('--dsbd_gamma', type=int, default=3)
     parser.add_argument('--dsbd_w_thres', type=float, default=0.9)
     parser.add_argument('--dsbd_min_w', type=int, default=1)
@@ -235,10 +240,13 @@ def evaluate(approx_model_name,
         skip_baselines = False,
         metrics_csv = "logs/constraint_metrics.csv",
         dsbd_width = 4,
+        dsbd_widths = None,
+        width_ablation = False,
         dsbd_gamma = 3,
         dsbd_w_thres = 0.9,
         dsbd_min_w = 1,
         dsbd_extra_sample_cnt = 1,
+        hypothesis_run = False,
         ):
     torch_device = 'cuda' if torch.cuda.is_available() else 'cpu'
     os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
@@ -380,11 +388,27 @@ SQL: SELECT count(*) FROM head WHERE age  >  56;
         em = None
 
     # Constraint ablation / fixed DSBD: prefer focused experiment path
-    use_fixed = fixed_dsbd or constraint_ablation or constraints != "none"
+    if isinstance(dsbd_widths, str):
+        dsbd_widths = [int(x) for x in dsbd_widths.split(",") if x.strip()] if dsbd_widths.strip() else None
+    if width_ablation and not dsbd_widths:
+        dsbd_widths = [2, 3, 4, 5]
+    use_width_sweep = bool(dsbd_widths)
+    use_fixed = fixed_dsbd or constraint_ablation or use_width_sweep or constraints != "none"
+    if hypothesis_run:
+        constraint_ablation = True
+        fixed_dsbd = True
+        skip_baselines = False
+        use_fixed = True
     if constraint_ablation:
         constraint_modes = ["none", "xgrammar", "z3", "both"]
     else:
         constraint_modes = [constraints]
+    if hypothesis_run:
+        ar_modes = ["none", "both"]
+    elif not skip_baselines:
+        ar_modes = [constraint_modes[0]]
+    else:
+        ar_modes = []
 
     ori_output_dataset = output_dataset
     for i in range(repeats):
@@ -406,76 +430,77 @@ SQL: SELECT count(*) FROM head WHERE age  >  56;
             print(msg, file=log_f)
 
         ######################################################################
-        # Large-model AR baseline (optional)
+        # Large-model AR baseline (optional; hypothesis_run = none + both)
         ######################################################################
         large_model_cnt = 0
-        if not skip_baselines:
-            total_time = 0
-            total_token = 0
-            scores = []
-            pred_seq = []
-            P = subprocess.Popen("exec python3 -u gpu_power_monitor.py",shell=True, text=True, stdout=subprocess.PIPE)
-            t1 = time.time()
-            for ex_i, input_ids in enumerate(tqdm(ds)):
-                large_model_cnt += 1
-                input_ids = input_ids.to(torch_device)
-                facts = _schema_facts_for_example(dataset_name, output_dataset, ex_i, spider_schema)
-                # AR baseline uses first constraint mode only when not ablating all for AR;
-                # keep unconstrained AR as quality ceiling unless constraints requested.
-                cm = _make_constraint_manager(constraint_modes[0] if constraint_modes[0] != "none" else "none",
-                                              tokenizer, facts,
-                                              vocab_size=getattr(large_model.config, "vocab_size", None))
-                t = process_time_ns()
-                output, details = autoregressive_sampling(
-                    input_ids, large_model, num_tokens,
-                    eos_token_id=tokenizer.eos_token_id,
-                    top_k=top_k, top_p=top_p, pad_token_id=tokenizer.pad_token_id,
-                    constraint_manager=cm, details=True)
-                wall = process_time_ns() - t
-                total_time += wall
-                committed = len(output[0]) - input_ids.size(1)
-                total_token += committed
-                score = get_score(output, large_model, input_ids.size(1))
-                scores.append(score.item())
-                pred = _decode_pred(tokenizer, output, input_ids.size(1), dataset_name)
-                pred_seq.append(pred)
-                db_id = output_dataset[ex_i].split("[SQL]")[0] if dataset_name == "spider" else None
-                exec_acc = None
-                if dataset_name == "spider":
-                    gt = output_dataset[ex_i].split("[SQL]")[1]
-                    exec_acc = float(max(execution_accuracy(db_id, pred, gt), 0))
-                row = compute_goodput_row(
-                    method="ar_target",
-                    constraints=constraint_modes[0] if cm is not None else "none",
-                    example_idx=ex_i,
-                    db_id=db_id,
-                    pred_sql=pred if dataset_name == "spider" else "",
-                    reference=output_dataset[ex_i] if dataset_name == "spider" else None,
-                    committed_tokens=details.get("committed_tokens", committed),
-                    tokens_proposed=details.get("tokens_proposed", committed),
-                    tokens_accepted=details.get("tokens_accepted", committed),
-                    tokens_constraint_rejected=details.get("tokens_constraint_rejected", 0),
-                    xgrammar_rejects=details.get("xgrammar_rejects", 0),
-                    z3_rejects=details.get("z3_rejects", 0),
-                    wall_time_ns=details.get("wall_time_ns", wall),
-                    xgrammar_time_ns=details.get("xgrammar_time_ns", 0),
-                    z3_time_ns=details.get("z3_time_ns", 0),
-                    exec_acc=exec_acc,
-                )
-                _append_metrics_row(metrics_csv, row)
-                if total_time / 1e9 > max_seconds:
-                    log_both(f'terminated at {large_model_cnt}')
-                    break
-            t2 = time.time()
-            P.kill()
-            P.wait()
-            outputs = P.stdout.readlines()
-            power_total = get_total_power(outputs, t1, t2, None)
-            log_both(f'\nlarge model total time {total_time/1e9} s, total tokens {total_token}, average time {total_time/1e9/max(total_token,1)} s/token, prob_score = {np.mean(scores)}')
-            log_both(f'total power consumption: {power_total}')
-            if em is not None and pred_seq:
-                em_score = em(predictions=pred_seq, references=output_dataset[:large_model_cnt])
-                log_both(f'em score = {em_score}')
+        if ar_modes:
+            for amode in ar_modes:
+                total_time = 0
+                total_token = 0
+                scores = []
+                pred_seq = []
+                large_model_cnt = 0
+                P = subprocess.Popen("exec python3 -u gpu_power_monitor.py",shell=True, text=True, stdout=subprocess.PIPE)
+                t1 = time.time()
+                for ex_i, input_ids in enumerate(tqdm(ds, desc=f"AR c={amode}")):
+                    large_model_cnt += 1
+                    input_ids = input_ids.to(torch_device)
+                    facts = _schema_facts_for_example(dataset_name, output_dataset, ex_i, spider_schema)
+                    cm = _make_constraint_manager(
+                        amode, tokenizer, facts,
+                        vocab_size=getattr(large_model.config, "vocab_size", None),
+                    )
+                    t = process_time_ns()
+                    output, details = autoregressive_sampling(
+                        input_ids, large_model, num_tokens,
+                        eos_token_id=tokenizer.eos_token_id,
+                        top_k=top_k, top_p=top_p, pad_token_id=tokenizer.pad_token_id,
+                        constraint_manager=cm, details=True)
+                    wall = process_time_ns() - t
+                    total_time += wall
+                    committed = len(output[0]) - input_ids.size(1)
+                    total_token += committed
+                    score = get_score(output, large_model, input_ids.size(1))
+                    scores.append(score.item())
+                    pred = _decode_pred(tokenizer, output, input_ids.size(1), dataset_name)
+                    pred_seq.append(pred)
+                    db_id = output_dataset[ex_i].split("[SQL]")[0] if dataset_name == "spider" else None
+                    exec_acc = None
+                    if dataset_name == "spider":
+                        gt = output_dataset[ex_i].split("[SQL]")[1]
+                        exec_acc = float(max(execution_accuracy(db_id, pred, gt), 0))
+                    row = compute_goodput_row(
+                        method="ar_target",
+                        constraints=amode,
+                        example_idx=ex_i,
+                        db_id=db_id,
+                        pred_sql=pred if dataset_name == "spider" else "",
+                        reference=output_dataset[ex_i] if dataset_name == "spider" else None,
+                        committed_tokens=details.get("committed_tokens", committed),
+                        tokens_proposed=details.get("tokens_proposed", committed),
+                        tokens_accepted=details.get("tokens_accepted", committed),
+                        tokens_constraint_rejected=details.get("tokens_constraint_rejected", 0),
+                        xgrammar_rejects=details.get("xgrammar_rejects", 0),
+                        z3_rejects=details.get("z3_rejects", 0),
+                        wall_time_ns=details.get("wall_time_ns", wall),
+                        xgrammar_time_ns=details.get("xgrammar_time_ns", 0),
+                        z3_time_ns=details.get("z3_time_ns", 0),
+                        exec_acc=exec_acc,
+                    )
+                    _append_metrics_row(metrics_csv, row)
+                    if total_time / 1e9 > max_seconds:
+                        log_both(f'terminated at {large_model_cnt}')
+                        break
+                t2 = time.time()
+                P.kill()
+                P.wait()
+                outputs = P.stdout.readlines()
+                power_total = get_total_power(outputs, t1, t2, None)
+                log_both(f'\nAR (constraints={amode}) total time {total_time/1e9} s, total tokens {total_token}, average time {total_time/1e9/max(total_token,1)} s/token, prob_score = {np.mean(scores) if scores else float("nan")}')
+                log_both(f'total power consumption: {power_total}')
+                if em is not None and pred_seq:
+                    em_score = em(predictions=pred_seq, references=output_dataset[:large_model_cnt])
+                    log_both(f'em score = {em_score}')
         else:
             large_model_cnt = len(ds)
 
@@ -542,7 +567,7 @@ SQL: SELECT count(*) FROM head WHERE age  >  56;
         # DSBD — fixed config under constraints, else optional full grid
         ######################################################################
         if use_fixed:
-            width_list = [dsbd_width]
+            width_list = list(dsbd_widths) if use_width_sweep else [dsbd_width]
             extra_list = [dsbd_extra_sample_cnt]
             thres_list = [dsbd_w_thres]
             gamma_list = [dsbd_gamma]
@@ -760,9 +785,12 @@ if __name__ == "__main__":
             skip_baselines=args.skip_baselines,
             metrics_csv=args.metrics_csv,
             dsbd_width=args.dsbd_width,
+            dsbd_widths=args.dsbd_widths,
+            width_ablation=args.width_ablation,
             dsbd_gamma=args.dsbd_gamma,
             dsbd_w_thres=args.dsbd_w_thres,
             dsbd_min_w=args.dsbd_min_w,
             dsbd_extra_sample_cnt=args.dsbd_extra_sample_cnt,
+            hypothesis_run=args.hypothesis_run,
             )
      
