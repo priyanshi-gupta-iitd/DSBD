@@ -1,32 +1,53 @@
-"""Z3-backed schema semantic checks for (partial) Spider SQL."""
+"""Sound Z3 schema gate for (partial) Spider SQL.
+
+Only reject when a *completed* identifier is impossible given the schema.
+That is the smallest set that must not knock out a still-valid beam:
+
+* completed FROM/JOIN table name that is not a schema table
+* completed ``table.col`` / ``alias.col`` whose qualifier already resolves
+  and whose column is not on that table
+
+Never reject: incomplete BPE pieces, unknown qualifiers (alias may appear
+later in FROM), bare names (aliases / AS), punctuation, keywords.
+"""
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
 from time import process_time_ns
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple
 
-from z3 import Bool, Solver, And, Or, Not, BoolVal, sat
+from z3 import Bool, Solver, BoolVal, sat
 
 
-_IDENT = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\b")
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_FROM_JOIN = re.compile(r"\b(?:from|join)\b", re.I)
+_REGION_STOP = re.compile(
+    r"\b(?:where|group|order|limit|having|union|except|intersect|on)\b", re.I
+)
 _KEYWORDS = {
     "select", "from", "where", "join", "inner", "left", "right", "outer", "on",
     "group", "by", "order", "asc", "desc", "limit", "as", "and", "or", "not",
     "in", "like", "is", "null", "count", "sum", "avg", "min", "max", "distinct",
     "having", "union", "all", "between", "exists", "case", "when", "then", "else",
-    "end", "cast", "except", "intersect", "true", "false",
+    "end", "cast", "except", "intersect", "true", "false", "with",
 }
+
+
+def _ident_completed(sql: str, end: int) -> bool:
+    """True iff the ident ending at ``end`` is closed by a delimiter (not EOS)."""
+    if end >= len(sql):
+        return False
+    ch = sql[end]
+    return not (ch.isalnum() or ch == "_")
 
 
 @dataclass
 class SchemaFacts:
     db_id: str
     tables: Set[str] = field(default_factory=set)
-    # lowercased table -> set of lowercased columns
     columns: Dict[str, Set[str]] = field(default_factory=dict)
-    # column -> set of tables containing it
     column_to_tables: Dict[str, Set[str]] = field(default_factory=dict)
     types: Dict[Tuple[str, str], str] = field(default_factory=dict)
 
@@ -55,16 +76,14 @@ class SchemaFacts:
 
 class Z3SchemaChecker:
     """
-    Incremental semantic gate: completed identifiers in FROM/JOIN must be tables;
-    completed column refs must exist in schema (and in-scope tables when known).
-    Uses Z3 for the satisfiability check over schema facts.
+    Sound incremental semantic gate (see module docstring).
+    Uses Z3 only to test the completed-identifier axioms.
     """
 
     def __init__(self, facts: SchemaFacts):
         self.facts = facts
         self.time_ns = 0
         self.reject_count = 0
-        # Prebuild Z3 atoms
         self._table_vars = {t: Bool(f"table_{t}") for t in facts.tables}
         self._col_vars = {}
         for t, cols in facts.columns.items():
@@ -73,54 +92,84 @@ class Z3SchemaChecker:
 
     @staticmethod
     def _strip_literals(sql: str) -> str:
-        """Replace quoted strings so literal words are not treated as identifiers."""
         return re.sub(r"'[^']*'", "''", sql)
 
-    def _completed_tokens(self, sql: str) -> List[str]:
-        """Return identifier-like tokens; drop trailing incomplete fragment."""
-        sql = self._strip_literals(sql)
-        # If ends with alphanumeric without delimiter, last ident may be incomplete —
-        # still validate fully delimited prior idents only.
-        ends_incomplete = bool(sql) and (sql[-1].isalnum() or sql[-1] == "_")
-        idents = _IDENT.findall(sql)
-        if ends_incomplete and idents:
-            idents = idents[:-1]
-        return idents
+    def _from_join_regions(self, sql: str) -> Iterator[Tuple[int, int]]:
+        for m in _FROM_JOIN.finditer(sql):
+            lo = m.end()
+            stop = _REGION_STOP.search(sql, lo)
+            hi = stop.start() if stop else len(sql)
+            yield lo, hi
 
-    def _extract_from_tables(self, sql: str) -> Set[str]:
-        """Heuristic: names after FROM / JOIN until WHERE/GROUP/ORDER/LIMIT/ON."""
-        low = self._strip_literals(sql).lower()
-        tables: Set[str] = set()
-        for m in re.finditer(r"\b(?:from|join)\s+([a-z_][a-z0-9_]*)", low):
-            tables.add(m.group(1))
-        return tables
+    def _split_commas(self, sql: str, lo: int, hi: int) -> List[Tuple[int, int]]:
+        parts = []
+        start = lo
+        depth = 0
+        for i in range(lo, hi):
+            ch = sql[i]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            elif ch == "," and depth == 0:
+                parts.append((start, i))
+                start = i + 1
+        parts.append((start, hi))
+        return parts
 
-    def _extract_column_refs(self, sql: str) -> List[Tuple[Optional[str], str]]:
-        """Return (table_or_None, column) for qualified and bare column mentions outside keywords."""
+    def completed_from_tables(self, sql: str) -> List[str]:
+        """Completed table names in FROM/JOIN position (lowercased)."""
+        out: List[str] = []
+        for lo, hi in self._from_join_regions(sql):
+            for a, b in self._split_commas(sql, lo, hi):
+                idents = list(_IDENT.finditer(sql, a, b))
+                if not idents:
+                    continue
+                tm = idents[0]
+                name = tm.group(0).lower()
+                if name in _KEYWORDS:
+                    continue
+                if _ident_completed(sql, tm.end()):
+                    out.append(name)
+        return out
+
+    def alias_map(self, sql: str) -> Dict[str, str]:
+        """Completed aliases in FROM/JOIN → table. Incomplete aliases omitted."""
+        mapping: Dict[str, str] = {}
+        for lo, hi in self._from_join_regions(sql):
+            for a, b in self._split_commas(sql, lo, hi):
+                idents = list(_IDENT.finditer(sql, a, b))
+                if not idents:
+                    continue
+                tm = idents[0]
+                table = tm.group(0).lower()
+                if table in _KEYWORDS or not _ident_completed(sql, tm.end()):
+                    continue
+                rest = idents[1:]
+                if rest and rest[0].group(0).lower() == "as":
+                    rest = rest[1:]
+                if not rest:
+                    continue
+                am = rest[0]
+                alias = am.group(0).lower()
+                if alias in _KEYWORDS:
+                    continue
+                if _ident_completed(sql, am.end()):
+                    mapping[alias] = table
+        return mapping
+
+    def completed_qualified(self, sql: str) -> List[Tuple[str, str]]:
+        """Completed ``qual.col`` pairs (both sides closed by a delimiter)."""
         refs = []
-        low = self._strip_literals(sql)
-        # qualified
-        for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b", low):
+        for m in re.finditer(
+            r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)", sql
+        ):
+            if not _ident_completed(sql, m.end()):
+                continue
             refs.append((m.group(1).lower(), m.group(2).lower()))
-        # bare names that are not keywords / known tables — checked softly
-        for m in _IDENT.finditer(low):
-            name = m.group(1).lower()
-            if name in _KEYWORDS:
-                continue
-            # skip if this match is the table side of qualified already handled
-            if m.end() < len(low) and low[m.end()] == ".":
-                continue
-            # skip if previous char was '.'
-            if m.start() > 0 and low[m.start() - 1] == ".":
-                continue
-            refs.append((None, name))
         return refs
 
     def check_partial_sql(self, sql: str) -> bool:
-        """
-        Return True if partial SQL does not yet violate schema constraints.
-        Incomplete trailing identifiers are ignored.
-        """
         t0 = process_time_ns()
         try:
             ok = self._check(sql)
@@ -133,65 +182,36 @@ class Z3SchemaChecker:
     def _check(self, sql: str) -> bool:
         if not sql or not sql.strip():
             return True
-
+        sql = self._strip_literals(sql)
         solver = Solver()
-        # Schema axioms: existing tables/columns are True; others False via absence
         for t, v in self._table_vars.items():
-            solver.add(v == True)  # noqa: E712 — Z3 Bool
-        for (t, c), v in self._col_vars.items():
+            solver.add(v == True)  # noqa: E712
+        for (_t, _c), v in self._col_vars.items():
             solver.add(v == True)  # noqa: E712
 
-        completed = {x.lower() for x in self._completed_tokens(sql)}
-        from_tables = self._extract_from_tables(sql)
-        # Only validate FROM/JOIN tables that are completed identifiers
-        for t in from_tables:
-            if t not in completed and t not in self.facts.tables:
-                # still check — extract_from_tables only gets full matches
-                pass
-            if t in _KEYWORDS:
-                continue
-            if t not in self._table_vars:
-                # Unknown table: unsat
+        for table in self.completed_from_tables(sql):
+            if table not in self._table_vars:
                 solver.add(BoolVal(False))
             else:
-                solver.add(self._table_vars[t])
+                solver.add(self._table_vars[table])
 
-        # In-scope tables for column checks
-        scope = {t for t in from_tables if t in self.facts.tables}
-        # If no FROM yet, only reject clearly unknown qualified refs; bare names deferred
-        refs = self._extract_column_refs(sql)
-        # Only check refs whose column token is completed
-        for table, col in refs:
-            if col not in completed and table is None:
-                continue
+        aliases = self.alias_map(sql)
+        for qual, col in self.completed_qualified(sql):
             if col in _KEYWORDS:
                 continue
-            if col in self.facts.tables and table is None:
-                # bare table name appearing elsewhere is ok
-                continue
-            if table is not None:
-                if table not in self._table_vars:
-                    solver.add(BoolVal(False))
-                    continue
-                if (table, col) not in self._col_vars:
-                    solver.add(BoolVal(False))
-                else:
-                    solver.add(self._col_vars[(table, col)])
+            if qual in aliases:
+                table = aliases[qual]
+            elif qual in self.facts.tables:
+                table = qual
             else:
-                # bare column: must exist in some in-scope table, or any table if scope empty
-                candidates = []
-                search_tables = scope if scope else self.facts.tables
-                for t in search_tables:
-                    if (t, col) in self._col_vars:
-                        candidates.append(self._col_vars[(t, col)])
-                if not candidates:
-                    # Unknown column name
-                    if col not in self.facts.column_to_tables:
-                        solver.add(BoolVal(False))
-                else:
-                    solver.add(Or(*candidates) if len(candidates) > 1 else candidates[0])
+                # qualifier not yet bound (SELECT alias before FROM) — do not reject
+                continue
+            if (table, col) not in self._col_vars:
+                solver.add(BoolVal(False))
+            else:
+                solver.add(self._col_vars[(table, col)])
 
         return solver.check() == sat
 
     def would_accept_token(self, prefix_sql: str, new_piece: str) -> bool:
-        return self.check_partial_sql(prefix_sql + new_piece)
+        return self.check_partial_sql((prefix_sql or "") + (new_piece or ""))
