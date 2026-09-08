@@ -3,9 +3,31 @@ Code for AAAI'25 "[Dynamic-Width Speculative Beam Decoding for Efficient LLM Inf
 
 # Environment
 
-See `requirements.txt`. 
+For **Llama-3.2-1B + Llama-3.1-8B** (this eval), use the pins in `requirements.txt`. Do **not** install the paper's `transformers==4.35.2` — those Llama checkpoints need `transformers>=4.43.2`.
 
-Alternatively, you can use docker file `zongyueq/llmss:0.0.2`, then with command `source ~/miniconda3/bin/activate myenv; conda activate myenv;`
+| Package | Version | Why |
+|---------|---------|-----|
+| `torch` | keep your CUDA wheel (`>=2.1`) | paper used 2.1.1; do not force-downgrade a working install |
+| `transformers` | **4.44.2** | Llama 3.1/3.2 configs + tokenizers; `<4.50` avoids GenerationMixin breakage |
+| `tokenizers` | **0.19.1** | matches transformers 4.44.x (0.22.x is for 4.57+) |
+| `accelerate` | **0.34.2** | required for `device_map="auto"` |
+| `huggingface_hub` | `>=0.23.4,<0.26` | gated Meta downloads |
+
+```bash
+# 1) Install a CUDA torch that matches the machine (example CUDA 12.1)
+# pip install torch==2.4.1 --index-url https://download.pytorch.org/whl/cu121
+
+# 2) Then the rest (does not pin torch)
+pip install -r requirements.txt
+
+# 3) Llama-3 weights are gated: accept the license on Hugging Face, then
+huggingface-cli login
+# or: export HFTOKEN=hf_...   (evaluation.py reads HFTOKEN)
+```
+
+Mismatch that usually fails installs: `transformers 4.35` + `tokenizers 0.22`, or `transformers 4.57` + this repo's old beam helpers. After install you want `transformers==4.44.2` and `tokenizers==0.19.1`.
+
+Alternatively, the paper docker image is `zongyueq/llmss:0.0.2` (`source ~/miniconda3/bin/activate myenv; conda activate myenv`). That image is the old 4.35 stack — fine for OPT / Llama-2, not for Llama 3.2.
 
 Your GPU needs to support `nvidia-smi` to measure GPU energy consumption.
 

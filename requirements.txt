@@ -1,10 +1,25 @@
-transformers==4.35.2
-torch==2.1.1
-pandas==2.0.3
-datasets==2.15.0
-tqdm==4.66.1
-numpy==1.24.4
-evaluate==0.4.1
+# DSBD + Llama 3.1 / 3.2 (constrained Spider eval)
+#
+# Do NOT pip-install the paper pin transformers==4.35.2 for Llama-3.2-1B / Llama-3.1-8B.
+# Those checkpoints need transformers>=4.43.2 (RoPE / tokenizer / config).
+# Stay below 4.50 so HuggingFace GenerationMixin still matches this repo's KV-cache beam loop.
+#
+# PyTorch: keep a working CUDA build. The paper used 2.1.1; 2.2–2.5 are fine.
+# Installing torch==2.1.1 on top of a newer CUDA wheel is what usually breaks installs.
+
+transformers==4.44.2
+tokenizers==0.19.1
+accelerate==0.34.2
+huggingface_hub>=0.23.4,<0.26
+safetensors>=0.4.3
+sentencepiece>=0.2.0
+protobuf>=3.20.3
+
+pandas>=2.0.3
+datasets>=2.15.0
+tqdm>=4.66.1
+numpy>=1.24.4
+evaluate>=0.4.1
 xgrammar>=0.1.19
 z3-solver>=4.12.0
 matplotlib>=3.7.0

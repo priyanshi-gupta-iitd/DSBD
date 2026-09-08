@@ -267,9 +267,18 @@ class LlamaAttention(nn.Module):
                 base=self.rope_theta,
             )
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["factor"]
-            if scaling_type == "linear":
+            # Llama 3.1/3.2 use {"rope_type": "llama3", ...}; older configs use {"type": "linear"|"dynamic"}
+            scaling = self.config.rope_scaling
+            scaling_type = scaling.get("type") or scaling.get("rope_type")
+            scaling_factor = scaling.get("factor", 1.0)
+            if scaling_type in (None, "default", "llama3"):
+                # llama3 RoPE scaling is a no-op for short Spider sequences (<< 8k)
+                self.rotary_emb = LlamaRotaryEmbedding(
+                    self.head_dim,
+                    max_position_embeddings=self.max_position_embeddings,
+                    base=self.rope_theta,
+                )
+            elif scaling_type == "linear":
                 self.rotary_emb = LlamaLinearScalingRotaryEmbedding(
                     self.head_dim,
                     max_position_embeddings=self.max_position_embeddings,
