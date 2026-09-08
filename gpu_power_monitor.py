@@ -3,10 +3,16 @@ import numpy as np
 import time
 
 def get_power():
-    data = subprocess.run("nvidia-smi --query-gpu=power.draw --format=csv", capture_output=True, shell=True, text=True)
-    out = data.stdout.split('\n')[1:]
-    out = [float(x[:-1]) for x in out if x != '']
-    return np.sum(out)
+    try:
+        data = subprocess.run(
+            "nvidia-smi --query-gpu=power.draw --format=csv",
+            capture_output=True, shell=True, text=True,
+        )
+        out = data.stdout.split('\n')[1:]
+        out = [float(x[:-1]) for x in out if x != '']
+        return np.sum(out) if out else 0.0
+    except Exception:
+        return 0.0
 
 def main():
     while True:

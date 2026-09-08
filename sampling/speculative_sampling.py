@@ -21,7 +21,7 @@ def beam_speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Mod
                          num_beams: int = 8, min_num_beams: int = 1, extra_sample_cnt: int = -1,
                          expect_thres: float = 0.7,
                          temperature : float = 1, top_k : int = 0, top_p : float = 0, verbose : bool = False, random_seed : int = None,
-                         details : bool = False, debug_dict = None) -> torch.Tensor:
+                         details : bool = False, debug_dict = None, constraint_manager = None) -> torch.Tensor:
 
     #print(prefix)
     #xxx = input()
@@ -53,22 +53,35 @@ def beam_speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Mod
     target_call_times = 0
     approx_call_times = 0
     compute_expect_time = 0
+    tokens_proposed = 0
+    tokens_accepted = 0
+    tokens_constraint_rejected = 0
     d = {
                 'approx_time': approx_time,
                 'target_time': target_time,
                 'other_time': sample_time,
                 'acc_len': acc_len,
-                'acc_rate': np.mean(acc_rate),
+                'acc_rate': np.mean(acc_rate) if acc_rate else 0.0,
                 'target_call_times': target_call_times,
                 'approx_call_times': approx_call_times,
                 'target_model_time': 0,
                 'target_pre_cache_time': 0,
-                'target_post_prob_time': 0
+                'target_post_prob_time': 0,
+                'tokens_proposed': 0,
+                'tokens_accepted': 0,
+                'tokens_constraint_rejected': 0,
+                'xgrammar_time_ns': 0,
+                'z3_time_ns': 0,
+                'xgrammar_rejects': 0,
+                'z3_rejects': 0,
             }
     num_beams_list = []
 
     output_prefix = prefix
     init_len = seq_len
+
+    if constraint_manager is not None:
+        constraint_manager.sync_from_generated_ids([], num_beams=num_beams)
 
     start_t = process_time_ns()
 
@@ -86,6 +99,13 @@ def beam_speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Mod
             # generate x of size width * (prefix_len+gamma)
             tt = process_time_ns()
 
+            if constraint_manager is not None:
+                gen_ids = output_prefix[0, init_len:].tolist() if output_prefix.size(0) >= 1 else []
+                if output_prefix.size(0) > 1:
+                    # multi-beam prefix: sync from first live beam's generation
+                    gen_ids = output_prefix[0, init_len:].tolist()
+                constraint_manager.sync_from_generated_ids(gen_ids, num_beams=num_beams)
+
             ret = approx_model_cache.beam_sample_with_kv_cache(
                        output_prefix, 
                        gamma=gamma, 
@@ -97,6 +117,7 @@ def beam_speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Mod
                        output_scores = True,
                        ret_seq_scores = True,
                        optimization=False,
+                       constraint_manager=constraint_manager,
                        )
             out, all_seq, all_beam_idx, all_next_token, all_score, all_prob, all_input_idx = ret[0],ret[1],ret[2],ret[3],ret[4], ret[5], ret[6]
             if extra_sample_cnt == 1:
@@ -115,6 +136,8 @@ def beam_speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Mod
             #q, seq_q = out['scores'] # tuples of gamma * (width * vocab) ?
  
             inc_len = len(all_next_token)
+            for _toks in all_next_token:
+                tokens_proposed += int(_toks.numel())
             approx_call_times += 1
             approx_time += process_time_ns() - tt
 
@@ -283,6 +306,22 @@ def beam_speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Mod
                         if accept[j] == True: # from a valid beam
                             accept[j] = (p_score/(q_scores[j]+1e-6)) > r
 
+                        # Z3 semantic accept gate (force-reject even if p/q would accept)
+                        if accept[j] == True and constraint_manager is not None and constraint_manager.z3 is not None:
+                            parent = int(cur_beam_idx[j].item())
+                            tok_id = int(all_next_token[i][j].item())
+                            if constraint_manager.tokenizer is not None:
+                                prefix_ids = all_seq[i][parent, init_len:].tolist()
+                                prefix_sql = constraint_manager.tokenizer.decode(
+                                    prefix_ids, skip_special_tokens=True
+                                )
+                            else:
+                                prefix_sql = ""
+                            piece = constraint_manager.decode_token(tok_id)
+                            if not constraint_manager.z3.would_accept_token(prefix_sql, piece):
+                                accept[j] = False
+                                tokens_constraint_rejected += 1
+
                         if accept[j] == False:
                             # change accept rate
 #                            print(f'{cur_sample_idx[j]} rejected')
@@ -296,6 +335,7 @@ def beam_speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Mod
 
                             cur_p_prob = p_next_token_scores
                             acc_cnt += 1
+                            tokens_accepted += 1
                             acc_sample_list.append(cur_sample_idx[j].item())
     #                        print(cur_p_prob[:20])
      #           print('after verification')
@@ -358,6 +398,7 @@ def beam_speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Mod
 
                 #try:
                 t = sample(p_next_token_scores, num_samples = extra_sample_cnt)
+                tokens_proposed += int(extra_sample_cnt)
       #          print(p_next_token_scores[:15])
                 #xxx = input()
                 #except:
@@ -433,7 +474,7 @@ def beam_speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Mod
                     t = sample(cur_p_prob, num_samples = extra_sample_cnt)
 #                    t = sample(p_next_token_scores, num_samples = extra_sample_cnt)
                
-                
+                tokens_proposed += int(t.numel())
 
 
                 beam_idx = torch.div(t, vocab_size, rounding_mode='floor')
@@ -540,12 +581,16 @@ def beam_speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Mod
         print('inner overall time', (process_time_ns()-start_t)/1e9)
         print('acc len', np.mean(acc_len), len(acc_len), acc_len)
     if details == True:
+        xg_time = constraint_manager.xgrammar_time_ns if constraint_manager is not None else 0
+        z3_time = constraint_manager.z3_time_ns if constraint_manager is not None else 0
+        xg_rej = constraint_manager.xgrammar_rejects if constraint_manager is not None else 0
+        z3_rej = (constraint_manager.z3_rejects if constraint_manager is not None else 0)
         d = {
                 'approx_time': approx_time,
                 'target_time': target_time,
                 'other_time': sample_time,
                 'acc_len': acc_len,
-                'acc_rate': np.mean(acc_rate),
+                'acc_rate': np.mean(acc_rate) if len(acc_rate) else 0.0,
                 'target_call_times': target_call_times,
                 'approx_call_times': approx_call_times,
                 'num_beams_list': num_beams_list,
@@ -554,6 +599,15 @@ def beam_speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Mod
                 'target_post_prob_time': target_model_cache.forward_time_dict['norm_prob_time'],
                 'compute_expect_time': compute_expect_time,
                 'expect_cnt_list': expect_cnt_list,
+                'tokens_proposed': tokens_proposed,
+                'tokens_accepted': tokens_accepted,
+                'tokens_constraint_rejected': tokens_constraint_rejected + xg_rej,
+                'xgrammar_time_ns': xg_time,
+                'z3_time_ns': z3_time,
+                'xgrammar_rejects': xg_rej,
+                'z3_rejects': z3_rej,
+                'wall_time_ns': process_time_ns() - start_t,
+                'committed_tokens': int(output_prefix.size(-1) - init_len),
             }
         return output_prefix, d
     else:

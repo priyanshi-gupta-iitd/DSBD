@@ -7,11 +7,13 @@ import numpy as np
 
 @torch.no_grad()
 def autoregressive_sampling(x : torch.Tensor, model : torch.nn.Module, N : int, eos_token_id : int,  
-                            temperature : float = 1, top_k : int = 0, top_p : float = 0, pad_token_id = None):
+                            temperature : float = 1, top_k : int = 0, top_p : float = 0, pad_token_id = None,
+                            constraint_manager = None, details : bool = False):
 #    torch.manual_seed(123)
 
     n = len(x)
     T = len(x) + N
+    init_len = x.size(1)
 
     past_key_values = None
     if pad_token_id is None:
@@ -19,6 +21,12 @@ def autoregressive_sampling(x : torch.Tensor, model : torch.nn.Module, N : int, 
 
     decoder_x = torch.LongTensor([[pad_token_id]]).to(x.device)
     prob_list = []
+    tokens_proposed = 0
+    if constraint_manager is not None:
+        constraint_manager.sync_from_generated_ids([], num_beams=1)
+
+    from time import process_time_ns
+    start_t = process_time_ns()
     while n < T:
         # outputs = model(x)
         if past_key_values:
@@ -38,15 +46,33 @@ def autoregressive_sampling(x : torch.Tensor, model : torch.nn.Module, N : int, 
                 outputs = model(x, decoder_input_ids = decoder_x)
             else:
                 outputs = model(x)
-        last_p = norm_logits(outputs.logits[::, -1, :], temperature, top_k, top_p)
+        logits = outputs.logits[::, -1, :]
+        if constraint_manager is not None and constraint_manager.xgrammar is not None:
+            constraint_manager.ensure_beams(1)
+            constraint_manager.mask_logits(logits)
+        last_p = norm_logits(logits, temperature, top_k, top_p)
         past_key_values = outputs.past_key_values
         prob_list.append(last_p.cpu())
         idx_next = sample(last_p)
-        #print(last_p.nonzero())
-        #print(idx_next)
+        tokens_proposed += 1
 
-     #   print(last_p.nonzero())
-     #   print(idx_next)
+        # Z3 gate: resample from masked residual-like retry if needed
+        if constraint_manager is not None and constraint_manager.z3 is not None:
+            tries = 0
+            while tries < 8 and not constraint_manager.z3_allows(0, int(idx_next.item())):
+                last_p = last_p.clone()
+                last_p[0, idx_next] = 0
+                s = last_p.sum()
+                if s <= 0:
+                    break
+                last_p = last_p / s
+                idx_next = sample(last_p)
+                tries += 1
+                tokens_proposed += 1
+
+        if constraint_manager is not None:
+            constraint_manager.on_tokens_sampled([int(idx_next.item())])
+
         if model.config.is_encoder_decoder:
             decoder_x = torch.cat((decoder_x, idx_next), dim=1)
         else:
@@ -58,6 +84,34 @@ def autoregressive_sampling(x : torch.Tensor, model : torch.nn.Module, N : int, 
     #xxx = input()
     if model.config.is_encoder_decoder:
         x = torch.cat((x, decoder_x), dim=1)
+    if details:
+        d = {
+            "tokens_proposed": tokens_proposed,
+            "tokens_accepted": tokens_proposed,
+            "tokens_constraint_rejected": (
+                constraint_manager.stats_dict()["tokens_constraint_rejected"]
+                if constraint_manager is not None else 0
+            ),
+            "xgrammar_time_ns": constraint_manager.xgrammar_time_ns if constraint_manager else 0,
+            "z3_time_ns": constraint_manager.z3_time_ns if constraint_manager else 0,
+            "xgrammar_rejects": constraint_manager.xgrammar_rejects if constraint_manager else 0,
+            "z3_rejects": constraint_manager.z3_rejects if constraint_manager else 0,
+            "wall_time_ns": process_time_ns() - start_t,
+            "committed_tokens": int(x.size(-1) - init_len),
+            "acc_len": [],
+            "acc_rate": 1.0,
+            "approx_time": 0,
+            "target_time": process_time_ns() - start_t,
+            "other_time": 0,
+            "target_call_times": tokens_proposed,
+            "approx_call_times": 0,
+            "expect_cnt_list": [],
+            "compute_expect_time": 0,
+            "target_model_time": 0,
+            "target_pre_cache_time": 0,
+            "target_post_prob_time": 0,
+        }
+        return x, d
     return x#, prob_list
 
 @torch.no_grad()

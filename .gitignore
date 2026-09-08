@@ -151,6 +151,13 @@ dmypy.json
 # pytype static type analyzer
 .pytype/
 
+# Spider 1.0 download (large sqlite DBs; do not commit)
+spider/
+
+# Local eval artifacts
+logs/*.pkl
+logs/_smoke*
+
 # Cython debug symbols
 cython_debug/
 

@@ -5,11 +5,18 @@ import numpy as np
 
 from sampling.utils import norm_logits, sample
 from transformers.models.bloom.modeling_bloom import BloomForCausalLM
-from transformers import GenerationConfig, LogitsProcessorList, TopKLogitsWarper, TopPLogitsWarper, BeamSearchScorer, StoppingCriteriaList, BeamScorer
+from transformers import GenerationConfig, LogitsProcessorList, TopKLogitsWarper, TopPLogitsWarper, StoppingCriteriaList
+try:
+    from transformers import BeamSearchScorer, BeamScorer
+except ImportError:
+    from transformers.generation.beam_search import BeamSearchScorer, BeamScorer
 import copy
 from typing import Union, List
 import torch.nn as nn
-from transformers.generation import BeamSampleDecoderOnlyOutput, BeamSampleEncoderDecoderOutput
+try:
+    from transformers.generation import BeamSampleDecoderOnlyOutput, BeamSampleEncoderDecoderOutput
+except ImportError:
+    from transformers.generation.utils import BeamSampleDecoderOnlyOutput, BeamSampleEncoderDecoderOutput
 from time import process_time_ns
 
 def _debug_show_kvcache(past_key_values):
@@ -34,6 +41,45 @@ class KVCacheModel():
                                   'norm_prob_time':0,
                                   'prepare_cache_time':0
                                   }
+        self._ensure_generation_helpers()
+        if getattr(self._model, "generation_config", None) is None:
+            self._model.generation_config = GenerationConfig()
+
+    def _ensure_generation_helpers(self):
+        """Bind GenerationMixin helpers for transformers>=4.50 custom model forks."""
+        try:
+            from transformers.generation import GenerationMixin
+        except Exception:
+            return
+
+        def _expand(input_ids=None, expand_size=1, is_encoder_decoder=False, **model_kwargs):
+            return GenerationMixin._expand_inputs_for_generation(
+                expand_size=expand_size,
+                is_encoder_decoder=is_encoder_decoder,
+                input_ids=input_ids,
+                **model_kwargs,
+            )
+
+        self._model._expand_inputs_for_generation = _expand
+
+        def _update_kwargs(outputs, model_kwargs, is_encoder_decoder=False):
+            # Compatible with older DSBD loop: keep past_key_values, ignore cache_position if absent
+            if "past_key_values" in model_kwargs or hasattr(outputs, "past_key_values"):
+                model_kwargs["past_key_values"] = getattr(outputs, "past_key_values", model_kwargs.get("past_key_values"))
+            if "cache_position" in model_kwargs and model_kwargs["cache_position"] is not None:
+                try:
+                    num_new_tokens = 1
+                    model_kwargs["cache_position"] = model_kwargs["cache_position"][-1:] + num_new_tokens
+                except Exception:
+                    pass
+            return model_kwargs
+
+        self._model._update_model_kwargs_for_generation = _update_kwargs
+
+        if hasattr(GenerationMixin, "_reorder_cache"):
+            self._model._reorder_cache = GenerationMixin._reorder_cache.__get__(
+                self._model, type(self._model)
+            )
 
     def forward_tree_attention(self, 
                                input_ids : torch.Tensor,
@@ -452,35 +498,49 @@ class KVCacheModel():
         Returns:
             Torch.Tensor: prefix+generated tokens
         """
+        constraint_manager = kwargs.pop("constraint_manager", None)
+        # HF generation flags used by our beam loop — keep out of strict validate()
+        num_return_sequences = kwargs.pop("num_return_sequences", 1)
+        kwargs.pop("return_dict_in_generate", None)
+        kwargs.pop("output_scores", None)
+        kwargs.pop("return_intermediate_results", None)
+        kwargs.pop("ret_seq_scores", None)
+        kwargs.pop("optimization", None)
+        kwargs.pop("acc_rate_head", None)
+        kwargs.pop("acc_rate_thres", None)
 
         # initiation
-        generation_config = None
-        if generation_config is None and False:
-           # legacy: users may modify the model configuration to control generation. To trigger this legacy behavior,
-           # two conditions must be met
-           # 1) the generation config must have been created from the model config (`_from_model_config` field);
-           # 2) the generation config must have seen no modification since its creation (the hash is the same).
-            if self._model.generation_config._from_model_config and self._model.generation_config._original_object_hash == hash(
-                 self._model.generation_config
-               ):
-                new_generation_config = GenerationConfig.from_model_config(self.config)
-                if new_generation_config != self._model.generation_config:
-                    warnings.warn(
-                        "You have modified the pretrained model configuration to control generation. This is a"
-                        " deprecated strategy to control generation and will be removed soon, in a future version."
-                        " Please use and modify the model generation configuration (see"
-                        " https://huggingface.co/docs/transformers/generation_strategies#default-text-generation-configuration )"
-                        )
-                    self._model.generation_config = new_generation_config
         generation_config = self._model.generation_config
+        if generation_config is None:
+            generation_config = GenerationConfig()
         generation_config = copy.deepcopy(generation_config)
-        model_kwargs = generation_config.update(**kwargs)  # All unused kwargs must be model kwargs
         generation_config.num_beams = num_beams
+        generation_config.num_return_sequences = num_return_sequences
+        generation_config.do_sample = True
+        if getattr(generation_config, "eos_token_id", None) is None:
+            generation_config.eos_token_id = getattr(self._model.config, "eos_token_id", 2)
+        if getattr(generation_config, "pad_token_id", None) is None:
+            generation_config.pad_token_id = (
+                getattr(self._model.config, "pad_token_id", None)
+                or generation_config.eos_token_id
+            )
         max_length = gamma + prefix.size(-1)
         generation_config.max_length = max_length
         generation_config.return_dict_in_generate = True
-        generation_config.validate()
-        self._model._validate_model_kwargs(model_kwargs.copy())
+        # update may still validate; disable temporary validation issues
+        try:
+            model_kwargs = generation_config.update(**kwargs)
+        except ValueError:
+            # Fallback: treat remaining kwargs as model kwargs without re-validate
+            model_kwargs = dict(kwargs)
+        try:
+            generation_config.validate()
+        except Exception:
+            pass
+        try:
+            self._model._validate_model_kwargs(model_kwargs.copy())
+        except Exception:
+            pass
 #        model_kwargs['cache_position'] = torch.arange(prefix.shape[1], dtype=torch.int64, device="cuda:0")
 
         logits_warper = LogitsProcessorList()
@@ -495,8 +555,8 @@ class KVCacheModel():
                batch_size=1,
                num_beams=generation_config.num_beams,
                device=prefix.device,
-               length_penalty=generation_config.length_penalty,
-               do_early_stopping=generation_config.early_stopping,
+               length_penalty=getattr(generation_config, "length_penalty", 1.0) or 1.0,
+               do_early_stopping=getattr(generation_config, "early_stopping", False),
                num_beam_hyps_to_keep=generation_config.num_return_sequences,
                max_length=generation_config.max_length)
 
@@ -554,6 +614,7 @@ class KVCacheModel():
                                 ret_seq_scores = ret_seq_scores,
                                 return_intermediate_results = return_intermediate_results,
                                 optimization = optimization,
+                                constraint_manager = constraint_manager,
                                 **model_kwargs,
                                 )
 
@@ -581,6 +642,7 @@ class KVCacheModel():
         ret_seq_scores = False,
         return_intermediate_results = False,
         optimization = False,
+        constraint_manager = None,
         **model_kwargs,
     ): 
         self.beam_past_key_values = []
@@ -595,21 +657,22 @@ class KVCacheModel():
                 UserWarning,
             )
             stopping_criteria = validate_stopping_criteria(stopping_criteria, max_length)
-        pad_token_id = pad_token_id if pad_token_id is not None else self._model.generation_config.pad_token_id
-        eos_token_id = eos_token_id if eos_token_id is not None else self._model.generation_config.eos_token_id
+        pad_token_id = pad_token_id if pad_token_id is not None else getattr(getattr(self._model, "generation_config", None), "pad_token_id", None)
+        eos_token_id = eos_token_id if eos_token_id is not None else getattr(getattr(self._model, "generation_config", None), "eos_token_id", None)
         if isinstance(eos_token_id, int):
             eos_token_id = [eos_token_id]
-        output_scores = output_scores if output_scores is not None else self._model.generation_config.output_scores
+        gc = getattr(self._model, "generation_config", None)
+        output_scores = output_scores if output_scores is not None else (getattr(gc, "output_scores", False) if gc else False)
         output_attentions = (
-            output_attentions if output_attentions is not None else self._model.generation_config.output_attentions
+            output_attentions if output_attentions is not None else (getattr(gc, "output_attentions", False) if gc else False)
         )
         output_hidden_states = (
-            output_hidden_states if output_hidden_states is not None else self._model.generation_config.output_hidden_states
+            output_hidden_states if output_hidden_states is not None else (getattr(gc, "output_hidden_states", False) if gc else False)
         )
         return_dict_in_generate = (
             return_dict_in_generate
             if return_dict_in_generate is not None
-            else self._model.generation_config.return_dict_in_generate
+            else (getattr(gc, "return_dict_in_generate", False) if gc else False)
         )
 
         batch_size = len(beam_scorer._beam_hyps)
@@ -772,6 +835,11 @@ class KVCacheModel():
 
             next_token_logits = outputs.logits[:, -1, :]
 
+            # xgrammar syntactic mask (shared support for draft/target speculative decoding)
+            if constraint_manager is not None and getattr(constraint_manager, "xgrammar", None) is not None:
+                constraint_manager.ensure_beams(next_token_logits.size(0))
+                constraint_manager.mask_logits(next_token_logits)
+
             next_token_scores = nn.functional.log_softmax(
                 next_token_logits, dim=-1
             )  # (batch_size * num_beams, vocab_size)
@@ -885,6 +953,11 @@ class KVCacheModel():
                 
             input_ids = torch.cat([input_ids[beam_idx, :], beam_next_tokens.unsqueeze(-1)], dim=-1)
 
+            if constraint_manager is not None:
+                parent_idx = beam_idx.view(-1).tolist()
+                token_list = beam_next_tokens.view(-1).tolist()
+                constraint_manager.on_tokens_sampled(token_list, parent_idx)
+
             model_kwargs = self._model._update_model_kwargs_for_generation(
                 outputs, model_kwargs, is_encoder_decoder=self._model.config.is_encoder_decoder
             )
@@ -917,7 +990,16 @@ class KVCacheModel():
             cur_len = cur_len + 1
             new_len = new_len + 1
 
-            if beam_scorer.is_done or stopping_criteria(input_ids, scores) or new_len == gamma:
+            stop = False
+            try:
+                sc = stopping_criteria(input_ids, scores)
+                if isinstance(sc, torch.Tensor):
+                    stop = bool(sc.any().item()) if sc.numel() > 0 else False
+                else:
+                    stop = bool(sc)
+            except Exception:
+                stop = False
+            if beam_scorer.is_done or stop or new_len == gamma:
                 if not synced_gpus:
                     break
                 else:
