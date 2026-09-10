@@ -44,6 +44,8 @@ def load_metrics_csv(path: str) -> pd.DataFrame:
         aligned.append(row)
 
     df = pd.DataFrame(aligned, columns=header)
+    if "constraint_site" not in df.columns:
+        df["constraint_site"] = "draft"
     numeric = [
         "example_idx", "committed_tokens", "tokens_proposed", "tokens_accepted",
         "tokens_constraint_rejected", "xgrammar_rejects", "z3_rejects",
@@ -66,8 +68,15 @@ def load_metrics_csv(path: str) -> pd.DataFrame:
 def summarize(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     group_cols = ["method", "constraints"]
+    if "constraint_site" in df.columns and df["constraint_site"].nunique(dropna=True) > 1:
+        group_cols = ["method", "constraints", "constraint_site"]
+    elif "constraint_site" in df.columns:
+        group_cols = ["method", "constraints", "constraint_site"]
     if "width" in df.columns and df["width"].nunique(dropna=True) > 1:
-        group_cols = ["method", "constraints", "width"]
+        if "constraint_site" in group_cols:
+            group_cols = ["method", "constraints", "constraint_site", "width"]
+        else:
+            group_cols = ["method", "constraints", "width"]
     for keys, g in df.groupby(group_cols, dropna=False):
         if not isinstance(keys, tuple):
             keys = (keys,)
@@ -98,7 +107,7 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
         if "width" not in rec and "width" in g.columns:
             rec["width"] = g["width"].iloc[0]
         rows.append(rec)
-    sort_cols = [c for c in ["method", "constraints", "width"] if c in rows[0]] if rows else ["method"]
+    sort_cols = [c for c in ["method", "constraints", "constraint_site", "width"] if c in rows[0]] if rows else ["method"]
     return pd.DataFrame(rows).sort_values(sort_cols)
 
 
@@ -170,7 +179,12 @@ def maybe_plot(summary: pd.DataFrame, out_dir: str):
 
     def _series_label(r):
         m = {"ar_target": "AR", "dsbd": "DSBD", "sd": "SD"}.get(str(r["method"]), str(r["method"]))
-        return f"{m}/{r['constraints']}"
+        site = ""
+        if "constraint_site" in r.index and pd.notna(r.get("constraint_site")) and str(r["constraints"]) != "none":
+            # only annotate site for constrained DSBD points when useful
+            if str(r["method"]) == "dsbd":
+                site = f"@{r['constraint_site']}"
+        return f"{m}/{r['constraints']}{site}"
 
     plot_2x2 = plot_2x2.assign(
         _method_rank=plot_2x2["method"].map(lambda m: _method_order.get(str(m), 99)),
@@ -407,7 +421,26 @@ def main():
         bad = df[df.get("executable", 1) == 0] if "executable" in df.columns else df
         print(bad["exec_error"].fillna("").value_counts().head(15).to_string())
     if not args.no_plot:
-        maybe_plot(summary, args.plot_dir)
+        sites = []
+        if "constraint_site" in df.columns:
+            sites = [s for s in ["draft", "main", "both"] if s in set(df["constraint_site"].astype(str))]
+        if len(sites) > 1:
+            # AR rows (site=main) are included in every site plot as the no-spec baseline
+            for site in sites:
+                if "constraint_site" in summary.columns:
+                    sub = summary[
+                        (summary["constraint_site"].astype(str) == site)
+                        | (summary["method"] == "ar_target")
+                    ]
+                else:
+                    sub = summary
+                out = os.path.join(args.plot_dir, f"site_{site}")
+                maybe_plot(sub, out)
+                print(f"Wrote site={site} plots to {out}")
+            # also overall combined plot
+            maybe_plot(summary, args.plot_dir)
+        else:
+            maybe_plot(summary, args.plot_dir)
 
 
 if __name__ == "__main__":

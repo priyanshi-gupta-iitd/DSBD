@@ -835,8 +835,12 @@ class KVCacheModel():
 
             next_token_logits = outputs.logits[:, -1, :]
 
-            # xgrammar syntactic mask (shared support for draft/target speculative decoding)
-            if constraint_manager is not None and getattr(constraint_manager, "xgrammar", None) is not None:
+            # xgrammar syntactic mask on the *draft* model (when site includes draft)
+            if (
+                constraint_manager is not None
+                and getattr(constraint_manager, "xgrammar", None) is not None
+                and constraint_manager.apply_on_draft
+            ):
                 constraint_manager.ensure_beams(next_token_logits.size(0))
                 constraint_manager.mask_logits(next_token_logits)
 
@@ -894,8 +898,12 @@ class KVCacheModel():
 #            next_tokens = torch.multinomial(probs, num_samples=num_beams, replacement=True)
                 next_tokens = sample(probs, num_beams)
 
-            # Z3 semantic gate on the *draft* model: resample illegal tokens before commit
-            if constraint_manager is not None and getattr(constraint_manager, "z3", None) is not None:
+            # Z3 semantic gate on the *draft* model (when site includes draft)
+            if (
+                constraint_manager is not None
+                and getattr(constraint_manager, "z3", None) is not None
+                and constraint_manager.apply_on_draft
+            ):
                 next_tokens = constraint_manager.z3_resample_flat(
                     next_tokens, probs, vocab_size, max_tries=8
                 )

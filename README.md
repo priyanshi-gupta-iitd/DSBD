@@ -186,6 +186,23 @@ bash scripts/run_hypothesis_gpu.sh
 
 Expected time (weights cached): **~15–25 min** at 5 examples, **~40–70 min** at 20, **~1.5–2.5 h** at the default 50. Outputs: `logs/hypothesis_metrics.csv`, `logs/hypothesis_plots/goodput_vs_accuracy.png`.
 
+**2d. Constraint site ablation (draft vs main vs both)** — same 2×2 modes, but applies constraints on the draft model, on target verify only, or on both. Separate plot folders per site:
+
+```bash
+bash scripts/run_site_ablation_gpu.sh
+# cheaper: NUM_INPUTS=20 bash scripts/run_site_ablation_gpu.sh
+# single site only:
+#   python evaluation.py ... --hypothesis_run --constraint_site main
+```
+
+| `--constraint_site` | Draft (approx) | Main (target verify) |
+|---|---|---|
+| `draft` | xgrammar mask + Z3 resample | off |
+| `main` | off | force-reject (Z3 / xgrammar) |
+| `both` | on | on |
+
+Expected time: **~2–4 h** at `NUM_INPUTS=20` (3 sites × 4 DSBD modes + AR); **~4–8 h** at 50. Plots: `logs/site_ablation_plots/site_{draft,main,both}/`.
+
 **3. Aggregate + plots:**
 
 ```bash

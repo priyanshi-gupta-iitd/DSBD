@@ -47,7 +47,12 @@ def autoregressive_sampling(x : torch.Tensor, model : torch.nn.Module, N : int, 
             else:
                 outputs = model(x)
         logits = outputs.logits[::, -1, :]
-        if constraint_manager is not None and constraint_manager.xgrammar is not None:
+        # AR is the main model: apply xgrammar when site includes main, or draft-only
+        # experiments that still want a single-model constrained baseline.
+        apply_ar = constraint_manager is not None and (
+            constraint_manager.apply_on_main or constraint_manager.apply_on_draft
+        )
+        if apply_ar and constraint_manager.xgrammar is not None:
             constraint_manager.ensure_beams(1)
             constraint_manager.mask_logits(logits)
         last_p = norm_logits(logits, temperature, top_k, top_p)
@@ -57,7 +62,7 @@ def autoregressive_sampling(x : torch.Tensor, model : torch.nn.Module, N : int, 
         tokens_proposed += 1
 
         # Z3 gate: resample from masked residual-like retry if needed
-        if constraint_manager is not None and constraint_manager.z3 is not None:
+        if apply_ar and constraint_manager.z3 is not None:
             tries = 0
             while tries < 8 and not constraint_manager.z3_allows(0, int(idx_next.item())):
                 last_p = last_p.clone()
@@ -71,7 +76,17 @@ def autoregressive_sampling(x : torch.Tensor, model : torch.nn.Module, N : int, 
                 tokens_proposed += 1
 
         if constraint_manager is not None:
-            constraint_manager.on_tokens_sampled([int(idx_next.item())])
+            # AR advances grammar whenever constraints were applied on this step
+            if apply_ar:
+                constraint_manager.on_tokens_sampled(
+                    [int(idx_next.item())], advance_grammar=True
+                )
+            else:
+                constraint_manager.ensure_beams(1)
+                constraint_manager.beam_sql[0] = (
+                    constraint_manager.beam_sql[0]
+                    + constraint_manager.decode_token(int(idx_next.item()))
+                )
 
         if model.config.is_encoder_decoder:
             decoder_x = torch.cat((decoder_x, idx_next), dim=1)

@@ -14,6 +14,11 @@ from constraints.z3_schema import SchemaFacts, Z3SchemaChecker
 @dataclass
 class ConstraintConfig:
     mode: str = "none"  # none | xgrammar | z3 | both
+    # Where to apply active constraints during DSBD:
+    #   draft = draft model only (mask / resample)
+    #   main  = target verify force-reject only
+    #   both  = draft + main
+    site: str = "draft"  # draft | main | both
 
     @property
     def use_xgrammar(self) -> bool:
@@ -22,6 +27,14 @@ class ConstraintConfig:
     @property
     def use_z3(self) -> bool:
         return self.mode in ("z3", "both")
+
+    @property
+    def apply_on_draft(self) -> bool:
+        return self.site in ("draft", "both")
+
+    @property
+    def apply_on_main(self) -> bool:
+        return self.site in ("main", "both")
 
 
 class ConstraintManager:
@@ -51,6 +64,18 @@ class ConstraintManager:
             if schema_facts is None:
                 raise ValueError("schema_facts required for z3 constraints")
             self.z3 = Z3SchemaChecker(schema_facts)
+
+    @property
+    def apply_on_draft(self) -> bool:
+        return self.config.apply_on_draft
+
+    @property
+    def apply_on_main(self) -> bool:
+        return self.config.apply_on_main
+
+    @property
+    def site(self) -> str:
+        return self.config.site
 
     def reset(self, num_beams: int = 1):
         self.beam_sql = [""] * num_beams
@@ -116,12 +141,23 @@ class ConstraintManager:
             return ""
         return self.tokenizer.decode([int(token_id)], skip_special_tokens=True)
 
-    def on_tokens_sampled(self, token_ids: Sequence[int], parent_beam_idx: Optional[Sequence[int]] = None):
+    def on_tokens_sampled(
+        self,
+        token_ids: Sequence[int],
+        parent_beam_idx: Optional[Sequence[int]] = None,
+        advance_grammar: Optional[bool] = None,
+    ):
         """Update matcher + decoded SQL after draft/AR sampling a token per beam."""
+        if advance_grammar is None:
+            advance_grammar = self.apply_on_draft
         if parent_beam_idx is not None:
-            self.reorder(parent_beam_idx)
+            idxs = [int(i) for i in parent_beam_idx]
+            if self.beam_sql:
+                self.beam_sql = [self.beam_sql[i] if i < len(self.beam_sql) else "" for i in idxs]
+            if self.xgrammar is not None and advance_grammar:
+                self.xgrammar.fork_from(idxs)
         self.ensure_beams(len(token_ids))
-        if self.xgrammar is not None:
+        if self.xgrammar is not None and advance_grammar:
             self.xgrammar.accept_tokens(token_ids)
         for i, tid in enumerate(token_ids):
             self.beam_sql[i] = self.beam_sql[i] + self.decode_token(tid)
@@ -142,10 +178,9 @@ class ConstraintManager:
     ) -> torch.Tensor:
         """
         Resample draft flat indices (parent*vocab + tok) that fail the sound Z3 gate.
-        Operates on the draft model only; call before committing tokens / on_tokens_sampled.
-        ``beam_sql[parent]`` must still be the prefix for that parent beam.
+        Only used when apply_on_draft is True.
         """
-        if self.z3 is None:
+        if self.z3 is None or not self.apply_on_draft:
             return flat_ids
         flat_ids = flat_ids.clone()
         squeeze = False
@@ -164,18 +199,29 @@ class ConstraintManager:
                     tok = fid % vocab_size
                     if self.z3_allows(parent, tok):
                         break
-                    # force-reject this draft token and resample
                     probs[b, fid] = 0
                     s = probs[b].sum()
                     if s <= 0:
                         break
                     probs[b] = probs[b] / s
-                    # sample a single replacement for this beam slot
                     new_fid = torch.multinomial(probs[b], num_samples=1)
                     flat_ids[b, i] = new_fid
         return flat_ids.squeeze(0) if squeeze else flat_ids
 
-    def commit_token(self, beam_idx: int, token_id: int):
+    def verify_allows(self, prefix_sql: str, token_id: int, prefix_ids: Optional[Sequence[int]] = None) -> bool:
+        """
+        Target-side accept gate (apply_on_main). Returns False to force-reject a draft token
+        that already passed p/q.
+        """
+        if not self.apply_on_main:
+            return True
+        piece = self.decode_token(token_id)
+        if self.z3 is not None and not self.z3.would_accept_token(prefix_sql or "", piece):
+            return False
+        if self.xgrammar is not None and prefix_ids is not None:
+            if not self.xgrammar.would_accept_after(list(prefix_ids), int(token_id)):
+                return False
+        return True
         """Commit an accepted token onto a beam (after verify)."""
         self.ensure_beams(max(beam_idx + 1, len(self.beam_sql)))
         if self.xgrammar is not None and beam_idx < len(self.xgrammar.matchers):
@@ -225,12 +271,16 @@ def build_constraint_manager(
     tokenizer=None,
     schema_facts: Optional[SchemaFacts] = None,
     vocab_size: Optional[int] = None,
+    site: str = "draft",
 ) -> Optional[ConstraintManager]:
     mode = (mode or "none").lower()
+    site = (site or "draft").lower()
+    if site not in ("draft", "main", "both"):
+        raise ValueError(f"invalid constraint site: {site}")
     if mode == "none":
         return None
     return ConstraintManager(
-        ConstraintConfig(mode=mode),
+        ConstraintConfig(mode=mode, site=site),
         tokenizer=tokenizer,
         schema_facts=schema_facts,
         vocab_size=vocab_size,

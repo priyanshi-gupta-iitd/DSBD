@@ -78,6 +78,7 @@ def compute_goodput_row(
     acc_len_mean: float = 0.0,
     acc_rate: float = 0.0,
     exec_acc: Optional[float] = None,
+    constraint_site: str = "draft",
     extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build one metrics row; N_useful counts committed tokens only if SQL is executable."""
@@ -107,6 +108,7 @@ def compute_goodput_row(
     row = {
         "method": method,
         "constraints": constraints,
+        "constraint_site": constraint_site,
         "example_idx": example_idx,
         "db_id": db_id,
         "pred_sql": pred_sql,

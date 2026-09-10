@@ -127,6 +127,25 @@ class XGrammarSQLConstraint:
         self.time_ns += process_time_ns() - t0
         return bool(ok)
 
+    def would_accept_after(self, prefix_token_ids: Sequence[int], new_token_id: int) -> bool:
+        """
+        True iff replaying ``prefix_token_ids`` then ``new_token_id`` is legal.
+        Used for main/verify-side checks without mutating live draft matchers.
+        """
+        t0 = process_time_ns()
+        try:
+            matcher = self.xgr.GrammarMatcher(self.compiled)
+            for tid in prefix_token_ids:
+                if not matcher.accept_token(int(tid)):
+                    self.reject_count += 1
+                    return False
+            ok = bool(matcher.accept_token(int(new_token_id)))
+            if not ok:
+                self.reject_count += 1
+            return ok
+        finally:
+            self.time_ns += process_time_ns() - t0
+
     def rollback_beams(self, num_tokens: int = 1):
         t0 = process_time_ns()
         for matcher in self.matchers:
