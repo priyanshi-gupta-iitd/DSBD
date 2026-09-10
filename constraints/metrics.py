@@ -119,7 +119,11 @@ def compute_goodput_row(
         "wall_time_s": wall_s,
         "xgrammar_time_s": xgrammar_time_ns / 1e9,
         "z3_time_s": z3_time_ns / 1e9,
+        # throughput: all proposed tokens (draft beams + extras) / wall
         "throughput": (tokens_proposed / wall_s) if wall_s > 0 else 0.0,
+        # main_throughput: final committed tokens only (target output) / wall
+        # For AR this equals throughput; for DSBD it excludes rejected draft tokens.
+        "main_throughput": (committed_tokens / wall_s) if wall_s > 0 else 0.0,
         "goodput": (n_useful / wall_s) if wall_s > 0 else 0.0,
         "goodput_correct": (n_useful_correct / wall_s) if wall_s > 0 else 0.0,
         "useful_frac": (n_useful / tokens_proposed) if tokens_proposed > 0 else 0.0,

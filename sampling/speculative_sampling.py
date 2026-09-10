@@ -306,21 +306,7 @@ def beam_speculative_sampling(prefix : torch.Tensor, approx_model : torch.nn.Mod
                         if accept[j] == True: # from a valid beam
                             accept[j] = (p_score/(q_scores[j]+1e-6)) > r
 
-                        # Z3 semantic accept gate (force-reject even if p/q would accept)
-                        if accept[j] == True and constraint_manager is not None and constraint_manager.z3 is not None:
-                            parent = int(cur_beam_idx[j].item())
-                            tok_id = int(all_next_token[i][j].item())
-                            if constraint_manager.tokenizer is not None:
-                                prefix_ids = all_seq[i][parent, init_len:].tolist()
-                                prefix_sql = constraint_manager.tokenizer.decode(
-                                    prefix_ids, skip_special_tokens=True
-                                )
-                            else:
-                                prefix_sql = ""
-                            piece = constraint_manager.decode_token(tok_id)
-                            if not constraint_manager.z3.would_accept_token(prefix_sql, piece):
-                                accept[j] = False
-                                tokens_constraint_rejected += 1
+                        # Z3 is applied on the draft model (kvcache beam_sample), not on target verify.
 
                         if accept[j] == False:
                             # change accept rate

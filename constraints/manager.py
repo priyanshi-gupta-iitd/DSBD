@@ -133,6 +133,48 @@ class ConstraintManager:
         prefix = self.beam_sql[beam_idx] if beam_idx < len(self.beam_sql) else ""
         return self.z3.would_accept_token(prefix, piece)
 
+    def z3_resample_flat(
+        self,
+        flat_ids: torch.Tensor,
+        probs: torch.Tensor,
+        vocab_size: int,
+        max_tries: int = 8,
+    ) -> torch.Tensor:
+        """
+        Resample draft flat indices (parent*vocab + tok) that fail the sound Z3 gate.
+        Operates on the draft model only; call before committing tokens / on_tokens_sampled.
+        ``beam_sql[parent]`` must still be the prefix for that parent beam.
+        """
+        if self.z3 is None:
+            return flat_ids
+        flat_ids = flat_ids.clone()
+        squeeze = False
+        if flat_ids.dim() == 1:
+            flat_ids = flat_ids.unsqueeze(0)
+            squeeze = True
+        if probs.dim() == 1:
+            probs = probs.unsqueeze(0)
+        probs = probs.clone()
+        batch, k = flat_ids.shape
+        for b in range(batch):
+            for i in range(k):
+                for _ in range(max_tries):
+                    fid = int(flat_ids[b, i].item())
+                    parent = fid // vocab_size
+                    tok = fid % vocab_size
+                    if self.z3_allows(parent, tok):
+                        break
+                    # force-reject this draft token and resample
+                    probs[b, fid] = 0
+                    s = probs[b].sum()
+                    if s <= 0:
+                        break
+                    probs[b] = probs[b] / s
+                    # sample a single replacement for this beam slot
+                    new_fid = torch.multinomial(probs[b], num_samples=1)
+                    flat_ids[b, i] = new_fid
+        return flat_ids.squeeze(0) if squeeze else flat_ids
+
     def commit_token(self, beam_idx: int, token_id: int):
         """Commit an accepted token onto a beam (after verify)."""
         self.ensure_beams(max(beam_idx + 1, len(self.beam_sql)))

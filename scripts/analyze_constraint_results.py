@@ -47,14 +47,19 @@ def load_metrics_csv(path: str) -> pd.DataFrame:
     numeric = [
         "example_idx", "committed_tokens", "tokens_proposed", "tokens_accepted",
         "tokens_constraint_rejected", "xgrammar_rejects", "z3_rejects",
-        "wall_time_s", "xgrammar_time_s", "z3_time_s", "throughput", "goodput",
-        "goodput_correct", "useful_frac", "n_useful", "n_useful_correct",
+        "wall_time_s", "xgrammar_time_s", "z3_time_s", "throughput", "main_throughput",
+        "goodput", "goodput_correct", "useful_frac", "n_useful", "n_useful_correct",
         "executable", "exec_correct", "exec_acc", "acc_len_mean", "acc_rate",
         "width", "gamma", "w_thres", "min_w", "extra_sample_cnt",
     ]
     for col in numeric:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+    # Backfill main_throughput for older CSVs: committed tokens / wall (target output only)
+    if "main_throughput" not in df.columns or df["main_throughput"].isna().all():
+        wall = df["wall_time_s"].replace(0, np.nan)
+        df["main_throughput"] = df["committed_tokens"] / wall
+        df["main_throughput"] = df["main_throughput"].fillna(0.0)
     return df
 
 
@@ -69,6 +74,7 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
         rec = dict(zip(group_cols, keys))
         wall = g["wall_time_s"].sum()
         proposed = g["tokens_proposed"].sum()
+        committed = g["committed_tokens"].sum() if "committed_tokens" in g else 0.0
         useful = g["n_useful"].sum()
         useful_c = g["n_useful_correct"].sum()
         rec.update({
@@ -76,6 +82,7 @@ def summarize(df: pd.DataFrame) -> pd.DataFrame:
             "exec_acc_mean": g["exec_acc"].mean() if "exec_acc" in g else np.nan,
             "executable_rate": g["executable"].mean() if "executable" in g else np.nan,
             "throughput": (proposed / wall) if wall > 0 else 0.0,
+            "main_throughput": (committed / wall) if wall > 0 else 0.0,
             "goodput": (useful / wall) if wall > 0 else 0.0,
             "goodput_correct": (useful_c / wall) if wall > 0 else 0.0,
             "useful_frac": (useful / proposed) if proposed > 0 else 0.0,
@@ -224,11 +231,33 @@ def maybe_plot(summary: pd.DataFrame, out_dir: str):
         fig.savefig(os.path.join(out_dir, "goodput_correct_vs_accuracy.png"), dpi=150)
         plt.close(fig)
 
-    # bar: throughput vs goodput
+    # bar: all-proposed throughput vs main (committed) throughput
     fig, ax = plt.subplots(figsize=(max(8, 1.4 * len(plot_2x2)), 5))
     x = np.arange(len(plot_2x2))
     w = 0.35
     b1 = ax.bar(x - w / 2, plot_2x2["throughput"], w, label="throughput (all proposed tok/s)")
+    b2 = ax.bar(
+        x + w / 2,
+        plot_2x2["main_throughput"],
+        w,
+        label="main throughput (committed / wall)",
+    )
+    heights = _label_bars(ax, b1) + _label_bars(ax, b2)
+    _pad_ylim(ax, heights)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=20, ha="right")
+    ax.set_xlabel("Decoder / constraint mode")
+    ax.set_ylabel("tokens / s")
+    ax.set_title("All-proposed vs main-model throughput")
+    ax.legend()
+    ax.grid(True, axis="y", alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(out_dir, "throughput_vs_main.png"), dpi=150)
+    plt.close(fig)
+
+    # bar: main throughput vs goodput
+    fig, ax = plt.subplots(figsize=(max(8, 1.4 * len(plot_2x2)), 5))
+    b1 = ax.bar(x - w / 2, plot_2x2["main_throughput"], w, label="main throughput (committed tok/s)")
     b2 = ax.bar(x + w / 2, plot_2x2["goodput"], w, label="goodput (useful tok/s)")
     heights = _label_bars(ax, b1) + _label_bars(ax, b2)
     _pad_ylim(ax, heights)
@@ -236,7 +265,7 @@ def maybe_plot(summary: pd.DataFrame, out_dir: str):
     ax.set_xticklabels(labels, rotation=20, ha="right")
     ax.set_xlabel("Decoder / constraint mode")
     ax.set_ylabel("tokens / s")
-    ax.set_title("Throughput vs goodput")
+    ax.set_title("Main throughput vs goodput")
     ax.legend()
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()

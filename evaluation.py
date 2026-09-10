@@ -179,7 +179,7 @@ def _METRICS_FIELDS():
         "committed_tokens", "tokens_proposed", "tokens_accepted",
         "tokens_constraint_rejected", "xgrammar_rejects", "z3_rejects",
         "wall_time_s", "xgrammar_time_s", "z3_time_s",
-        "throughput", "goodput", "goodput_correct", "useful_frac",
+        "throughput", "main_throughput", "goodput", "goodput_correct", "useful_frac",
         "n_useful", "n_useful_correct", "executable", "exec_error", "exec_correct", "exec_acc",
         "acc_len_mean", "acc_rate",
         "width", "gamma", "w_thres", "min_w", "extra_sample_cnt",
